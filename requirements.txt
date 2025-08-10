@@ -1,0 +1,5 @@
+flask
+requests
+opencv-python-headless
+pillow
+numpy
