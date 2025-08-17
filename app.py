@@ -4,8 +4,6 @@ import time
 import math
 import json
 import random
-import signal
-import queue
 import threading
 import subprocess
 from pathlib import Path
@@ -14,7 +12,7 @@ from typing import Optional
 import numpy as np
 import cv2
 import requests
-from flask import Flask, jsonify, request, Response, make_response
+from flask import Flask, jsonify, request, make_response
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ----------------------------
@@ -22,24 +20,24 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 # ----------------------------
 WIDTH = int(os.getenv("WIDTH", "1280"))
 HEIGHT = int(os.getenv("HEIGHT", "720"))
-FPS = int(os.getenv("FPS", "24"))  # 20–30 is fine on Render Free
+FPS = int(os.getenv("FPS", "24"))
 FONT_PATH = os.getenv("FONT_PATH", "VT323-Regular.ttf")
 
 YOUTUBE_RTMP_URL = os.getenv("YOUTUBE_RTMP_URL", "rtmp://a.rtmp.youtube.com/live2")
-YOUTUBE_STREAM_KEY = os.getenv("YOUTUBE_STREAM_KEY")  # must be set in Render dashboard
+YOUTUBE_STREAM_KEY = os.getenv("YOUTUBE_STREAM_KEY")  # set in Render dashboard
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "./ffmpeg")    # downloaded in build step
 
 # Optional keep-alive (your service URL, e.g. https://your-service.onrender.com)
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# Optional external LLM endpoint for text (totally optional)
-LLM7_URL = os.getenv("LLM7_URL")  # if provided, we'll try POSTing to it for lines
+# Optional external LLM endpoint (optional)
+LLM7_URL = os.getenv("LLM7_URL")
 
 # Visual look
-BG_DARK = (8, 18, 8)            # very dark green
-SCANLINE_DARK = (6, 12, 6)      # darker stripe
+BG_DARK = (8, 18, 8)              # very dark green
+SCANLINE_DARK = (6, 12, 6)        # darker stripe
 TEXT_COLOR = (80, 255, 120, 255)  # bright green RGBA
-GLOW_BLUR = 2                   # px
+GLOW_BLUR = 2                     # px
 MARGIN_X = 40
 MARGIN_Y = 40
 MAX_TEXT_WIDTH = WIDTH - (MARGIN_X * 2)
@@ -48,8 +46,8 @@ MAX_TEXT_WIDTH = WIDTH - (MARGIN_X * 2)
 THOUGHT_MIN_SEC = 5
 THOUGHT_MAX_SEC = 9
 TYPE_SPEED_MIN = 28  # chars/sec
-TYPE_SPEED_MAX = 48  # chars/sec
-CURSOR_HZ = 2.0      # blink rate
+TYPE_SPEED_MAX = 48
+CURSOR_HZ = 2.0
 
 # ----------------------------
 # Flask app
@@ -62,7 +60,6 @@ app = Flask(__name__)
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     path = Path(FONT_PATH)
     if not path.exists():
-        # Fallback to default PIL font if missing, but warn
         print(f"[warn] Font not found at {FONT_PATH}; using default.", file=sys.stderr)
         return ImageFont.load_default()
     return ImageFont.truetype(str(path), size=size)
@@ -71,7 +68,8 @@ def _make_scanline_background(w: int, h: int) -> Image.Image:
     """Fast background with greenish tone + scanlines (every other row darker)."""
     base = np.full((h, w, 3), BG_DARK, dtype=np.uint8)
     base[::2, :, :] = SCANLINE_DARK  # darker every other row
-    return Image.fromarray(base, mode="RGB")
+    # Pillow >= 10: don't pass deprecated 'mode' arg
+    return Image.fromarray(base)
 
 def _text_width(text: str, font: ImageFont.FreeTypeFont) -> int:
     bbox = font.getbbox(text)
@@ -93,12 +91,10 @@ def _wrap_text_to_width(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> 
     return "\n".join(lines)
 
 def _draw_glow_text(canvas_rgba: Image.Image, xy, text: str, font: ImageFont.FreeTypeFont):
-    # glow layer
     overlay = Image.new("RGBA", canvas_rgba.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(overlay)
     d.multiline_text(xy, text, font=font, fill=TEXT_COLOR, spacing=4)
     glow = overlay.filter(ImageFilter.GaussianBlur(GLOW_BLUR))
-    # composite: background + glow + sharp text
     out = Image.alpha_composite(canvas_rgba, glow)
     out = Image.alpha_composite(out, overlay)
     return out
@@ -134,8 +130,6 @@ class ThoughtGen:
         if not LLM7_URL:
             return None
         try:
-            # Very lightweight, generic schema — adapt to your LLM7 API as needed.
-            # Expected to return {"text": "..."} or OpenAI-ish {"choices":[{"message":{"content":"..."}}]}
             payload = {"prompt": "Give one short, introspective line for an AI stream-of-consciousness.", "max_tokens": 60}
             r = requests.post(LLM7_URL, json=payload, timeout=6)
             r.raise_for_status()
@@ -153,12 +147,10 @@ class ThoughtGen:
                         if isinstance(txt, str):
                             return txt.strip()
         except Exception as e:
-            # Fail quietly; we'll synthesize a line instead
             print(f"[llm7] fallback due to: {e}", file=sys.stderr)
         return None
 
     def next_line(self) -> str:
-        # Prefer LLM, fallback to canned samples, avoid repeating the same line twice
         s = self._try_llm7()
         if not s or len(s) < 2:
             for _ in range(4):
@@ -231,7 +223,6 @@ class StreamWorker:
             if not self.running:
                 return False
             self.stop_evt.set()
-        # join outside the lock to avoid deadlocks
         if self.thread:
             self.thread.join(timeout=10)
         with self.lock:
@@ -241,7 +232,6 @@ class StreamWorker:
 
     def _refresh_thought_if_needed(self, now: float):
         if now >= self.next_thought_at or not self.full_text:
-            # Get a new line and wrap it
             raw_line = self.thoughts.next_line()
             wrapped = _wrap_text_to_width(raw_line, self.font, MAX_TEXT_WIDTH)
             self.full_text = wrapped
@@ -251,34 +241,27 @@ class StreamWorker:
             self.next_thought_at = now + random.uniform(THOUGHT_MIN_SEC, THOUGHT_MAX_SEC)
 
     def _compose_frame_bytes(self, now: float) -> bytes:
-        # Background (RGB) -> convert to RGBA for compositing
         bg_rgba = self.bg.convert("RGBA")
 
-        # Update typing progress
         elapsed = max(0.0, now - self.started_typing_at)
         target_chars = int(self.type_speed * elapsed)
         self.typed_chars = min(len(self.full_text), target_chars)
 
         display_text = self.full_text[: self.typed_chars]
-        # blinking cursor
         if math.floor(now * CURSOR_HZ) % 2 == 0:
             display_text += "_"
 
-        # Compose info lines (title/status)
         title = "TERMINALMIND01 — stream of consciousness"
         subtitle = f"{_now_ts()}  |  {self.width}x{self.height}@{self.fps}  |  frames:{self.frame_count}"
 
-        # Draw glow text
         composed = _draw_glow_text(bg_rgba, (MARGIN_X, MARGIN_Y), title, self.title_font)
         composed = _draw_glow_text(composed, (MARGIN_X, MARGIN_Y + 40), subtitle, self.font)
         composed = _draw_glow_text(composed, (MARGIN_X, MARGIN_Y + 100), display_text, self.font)
 
-        # Convert to RGB then BGR bytes for ffmpeg
         rgb = composed.convert("RGB")
         return _rgb_to_bgr_frame(rgb)
 
     def _run(self):
-        # Launch ffmpeg
         cmd = self._ffmpeg_cmd()
         print(f"[ffmpeg] starting: {' '.join(cmd[:-1])} ****", file=sys.stderr)
         self.proc = subprocess.Popen(
@@ -289,13 +272,11 @@ class StreamWorker:
             bufsize=0
         )
 
-        # Initialize first thought
         now = time.time()
         self.started_typing_at = now
         self.next_thought_at = now
         self._refresh_thought_if_needed(now)
 
-        # Frame loop
         frame_interval = 1.0 / float(self.fps)
         next_frame = time.time()
         try:
@@ -304,10 +285,9 @@ class StreamWorker:
                 if now < next_frame:
                     time.sleep(max(0.0, next_frame - now))
                     continue
-                # Possibly refresh thought
+
                 self._refresh_thought_if_needed(now)
 
-                # Compose and write one frame
                 try:
                     frame_bytes = self._compose_frame_bytes(now)
                     if self.proc and self.proc.stdin:
@@ -321,7 +301,6 @@ class StreamWorker:
                 self.frame_count += 1
                 next_frame += frame_interval
         finally:
-            # Cleanup
             try:
                 if self.proc and self.proc.stdin:
                     try:
@@ -342,24 +321,40 @@ class StreamWorker:
 STREAM = StreamWorker(WIDTH, HEIGHT, FPS)
 
 # ----------------------------
-# Optional keep-alive pinger
+# Keep-alive pinger (Flask 3-safe)
 # ----------------------------
-def _pinger():
+_keepalive_started = False
+_keepalive_lock = threading.Lock()
+
+def _start_keepalive_once():
+    global _keepalive_started
     if not RENDER_EXTERNAL_URL:
         return
-    url = RENDER_EXTERNAL_URL.rstrip("/") + "/healthz"
-    while True:
-        try:
-            requests.get(url, timeout=4)
-        except Exception:
-            pass
-        time.sleep(300)  # 5 minutes
+    with _keepalive_lock:
+        if _keepalive_started:
+            return
+        _keepalive_started = True
 
-@app.before_first_request
-def _start_bg_tasks():
-    if RENDER_EXTERNAL_URL:
+        def _pinger():
+            url = RENDER_EXTERNAL_URL.rstrip("/") + "/healthz"
+            while True:
+                try:
+                    requests.get(url, timeout=4)
+                except Exception:
+                    pass
+                time.sleep(300)  # 5 minutes
+
         t = threading.Thread(target=_pinger, name="keep-alive", daemon=True)
         t.start()
+        print("[keep-alive] started.", file=sys.stderr)
+
+# Try to start keep-alive at import time (works for both gunicorn and python app.py)
+_start_keepalive_once()
+
+# Also ensure first real request will trigger it (no-op if already started)
+@app.before_request
+def _maybe_start_keepalive():
+    _start_keepalive_once()
 
 # ----------------------------
 # Routes
@@ -396,7 +391,6 @@ def stop_stream():
 
 @app.get("/")
 def index():
-    # Tiny control panel for convenience
     html = f"""<!doctype html>
 <html>
 <head>
@@ -407,7 +401,6 @@ def index():
 body {{ background:#060; color:#cfc; font-family: monospace; padding: 1.5rem; }}
 button {{ font-family: inherit; font-size: 1rem; padding: 0.5rem 1rem; margin-right: 0.5rem; }}
 pre {{ white-space: pre-wrap; }}
-#log {{ margin-top: 1rem; }}
 </style>
 </head>
 <body>
@@ -439,10 +432,9 @@ refresh();
     return make_response(html, 200)
 
 # ----------------------------
-# Dev entrypoint (Render uses Gunicorn per render.yaml)
+# Dev entrypoint (Render may still try `python app.py`)
 # ----------------------------
 if __name__ == "__main__":
-    # For local testing only
     port = int(os.getenv("PORT", "8080"))
     print(f"[local] http://127.0.0.1:{port}")
     app.run(host="0.0.0.0", port=port)
