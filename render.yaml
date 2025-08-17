@@ -19,10 +19,10 @@ services:
       - key: RENDER_EXTERNAL_URL
         sync: false    # optional: https://<your-service>.onrender.com
       - key: WIDTH
-        sync: false    # optional override, default 1280
+        sync: false    # optional
       - key: HEIGHT
-        sync: false    # optional override, default 720
+        sync: false    # optional
       - key: FPS
-        sync: false    # optional override, default 24
+        sync: false    # optional
       - key: FONT_PATH
-        sync: false    # optional override, default VT323-Regular.ttf
+        sync: false    # optional (default VT323-Regular.ttf)
