@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import math
-import json
 import random
 import threading
 import subprocess
@@ -23,11 +22,12 @@ HEIGHT = int(os.getenv("HEIGHT", "720"))
 FPS = int(os.getenv("FPS", "24"))
 FONT_PATH = os.getenv("FONT_PATH", "VT323-Regular.ttf")
 
-YOUTUBE_RTMP_URL = os.getenv("YOUTUBE_RTMP_URL", "rtmp://a.rtmp.youtube.com/live2")
+# Use RTMPS (443) by default; more reliable than RTMP/1935 on some hosts
+YOUTUBE_RTMP_URL = os.getenv("YOUTUBE_RTMP_URL", "rtmps://a.rtmps.youtube.com/live2")
 YOUTUBE_STREAM_KEY = os.getenv("YOUTUBE_STREAM_KEY")  # set in Render dashboard
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "./ffmpeg")    # downloaded in build step
 
-# Optional keep-alive (your service URL, e.g. https://your-service.onrender.com)
+# Optional keep-alive (your service URL, e.g. https://<service>.onrender.com)
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Optional external LLM endpoint (optional)
@@ -68,7 +68,6 @@ def _make_scanline_background(w: int, h: int) -> Image.Image:
     """Fast background with greenish tone + scanlines (every other row darker)."""
     base = np.full((h, w, 3), BG_DARK, dtype=np.uint8)
     base[::2, :, :] = SCANLINE_DARK  # darker every other row
-    # Pillow >= 10: don't pass deprecated 'mode' arg
     return Image.fromarray(base)
 
 def _text_width(text: str, font: ImageFont.FreeTypeFont) -> int:
@@ -172,7 +171,7 @@ class StreamWorker:
         self.height = height
         self.fps = fps
         self.proc: Optional[subprocess.Popen] = None
-        self.thread: Optional[threading.Thread] = None
+               self.thread: Optional[threading.Thread] = None
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
         self.running = False
@@ -272,6 +271,20 @@ class StreamWorker:
             bufsize=0
         )
 
+        # --- ffmpeg log pump (prints ffmpeg's stdout/stderr to Render logs) ---
+        def _pump_ffmpeg_output(proc):
+            try:
+                for line in iter(proc.stdout.readline, b''):
+                    if not line:
+                        break
+                    print("[ffmpeg]", line.decode(errors="ignore").rstrip(), file=sys.stderr)
+            except Exception:
+                pass
+
+        tlog = threading.Thread(target=_pump_ffmpeg_output, args=(self.proc,), daemon=True)
+        tlog.start()
+        # ----------------------------------------------------------------------
+
         now = time.time()
         self.started_typing_at = now
         self.next_thought_at = now
@@ -348,10 +361,9 @@ def _start_keepalive_once():
         t.start()
         print("[keep-alive] started.", file=sys.stderr)
 
-# Try to start keep-alive at import time (works for both gunicorn and python app.py)
+# Kick off keep-alive at import and ensure first request also triggers it
 _start_keepalive_once()
 
-# Also ensure first real request will trigger it (no-op if already started)
 @app.before_request
 def _maybe_start_keepalive():
     _start_keepalive_once()
@@ -432,7 +444,7 @@ refresh();
     return make_response(html, 200)
 
 # ----------------------------
-# Dev entrypoint (Render may still try `python app.py`)
+# Dev entrypoint (Render uses Gunicorn per start command)
 # ----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
