@@ -3,12 +3,26 @@ services:
     name: terminalmind-stream
     env: python
     plan: free
+    region: oregon
     buildCommand: |
-      apt-get update && apt-get install -y ffmpeg
       pip install -r requirements.txt
-    startCommand: python app.py
+      curl -L -o ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+      tar -xf ffmpeg.tar.xz
+      mv ffmpeg-*-amd64-static/ffmpeg ./ffmpeg
+      chmod +x ./ffmpeg
+    startCommand: gunicorn -w 2 -k gthread -t 120 -b 0.0.0.0:$PORT app:app
     envVars:
       - key: YOUTUBE_STREAM_KEY
         sync: false
+      - key: YOUTUBE_RTMP_URL
+        sync: false    # e.g. rtmp://a.rtmp.youtube.com/live2
       - key: RENDER_EXTERNAL_URL
-        sync: false
+        sync: false    # optional: https://<your-service>.onrender.com
+      - key: WIDTH
+        sync: false    # optional override, default 1280
+      - key: HEIGHT
+        sync: false    # optional override, default 720
+      - key: FPS
+        sync: false    # optional override, default 24
+      - key: FONT_PATH
+        sync: false    # optional override, default VT323-Regular.ttf
